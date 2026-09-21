@@ -18,12 +18,15 @@ class Lue:
         self.loop = None
         self.file_path = file_path
         self.book_title = os.path.splitext(os.path.basename(file_path))[0]
-        self.progress_file = progress_manager.get_progress_file_path(self.book_title)
         self.overlap_override = overlap
-        
+
         self._initialize_state()
         self._initialize_tts(tts_model)
         self._load_content()
+        # Versioned state repository; constructing it also performs the
+        # one-time migration of legacy title-named progress files.
+        self.store = progress_manager.StateStore(config.PROGRESS_FILE_DIR)
+        self.identity = progress_manager.compute_identity(self.file_path)
         self._initialize_progress()
         self._initialize_ui_state()
         
@@ -108,12 +111,12 @@ class Lue:
         # Update file path and title
         self.file_path = new_path
         self.book_title = os.path.splitext(os.path.basename(new_path))[0]
-        self.progress_file = progress_manager.get_progress_file_path(self.book_title)
-        
+
         # Load new content quietly
         self._load_content(quiet=True)
-        
-        # Initialize progress for new book
+
+        # Recompute stable identity and initialize progress for new book
+        self.identity = progress_manager.compute_identity(new_path)
         self._initialize_progress()
         
         # Reset some state
@@ -177,38 +180,78 @@ class Lue:
         asyncio.create_task(ui.display_ui(self))
 
     def _initialize_progress(self):
-        """Initialize reading progress from saved state."""
-        progress_data = progress_manager.load_extended_progress(self.progress_file)
-        c, p, s = progress_data["c"], progress_data["p"], progress_data["s"]
-        
-        self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
-            progress_manager.validate_and_set_progress(self.chapters, self.progress_file, c, p, s)
-        )
+        """Initialize reading progress from the versioned state repository.
+
+        Exact identity hits are used directly; moved/slightly edited files
+        are re-located through normalized text anchors.  When no reliable
+        match exists the previous record is retained (explicit fallback)
+        rather than deleted.
+        """
+        fingerprint = progress_manager.build_fingerprint(self.chapters)
+        self.store._current_chapters = self.chapters
+        try:
+            resolution = self.store.resolve(self.identity, fingerprint)
+        finally:
+            self.store._current_chapters = None
+
+        self.relocation = {
+            "status": resolution["status"],
+            "reason": resolution.get("reason"),
+            "kept_book_id": resolution.get("kept_book_id"),
+            "kept_path": resolution.get("kept_path"),
+        }
+
+        if resolution["status"] in ("exact", "relocated"):
+            position = resolution["position"]
+            entry = resolution["entry"]
+            c, p, s = position["c"], position["p"], position["s"]
+            ui_state = entry.get("ui", {})
+        else:
+            # New book, or fallback after keeping the old record elsewhere.
+            c, p, s = 0, 0, 0
+            ui_state = {}
+
+        self.chapter_idx, self.paragraph_idx, self.sentence_idx = c, p, s
         self.ui_chapter_idx = self.chapter_idx
         self.ui_paragraph_idx = self.paragraph_idx
         self.ui_sentence_idx = self.sentence_idx
         self.ui_word_idx = 0  # Current word index for word-level highlighting
-        
-        self.scroll_offset = progress_data["scroll_offset"]
-        self.auto_scroll_enabled = progress_data["auto_scroll_enabled"]
+
+        self.scroll_offset = float(ui_state.get("scroll_offset", 0))
+        self.auto_scroll_enabled = bool(ui_state.get("auto_scroll_enabled", True))
         if getattr(config, "UI_MODE_OVERRIDE", False):
             self.speed_reading_enabled = (config.UI_MODE == 3)
         else:
-            self.speed_reading_enabled = progress_data.get("speed_reading_enabled", False)
+            self.speed_reading_enabled = bool(
+                ui_state.get("speed_reading_enabled", False)
+            )
         if self.speed_reading_enabled:
             config.UI_MODE = 3
-        self.is_paused = not progress_data["tts_enabled"]
-        self.playback_speed = progress_data["playback_speed"]
+        self.is_paused = not bool(ui_state.get("tts_enabled", True))
+        self.playback_speed = float(ui_state.get("playback_speed", 1.0))
         if not self.tts_model:
             self.is_paused = True
-            
+
         # Restore manual scroll position if available
-        manual_anchor = progress_data.get("manual_scroll_anchor")
+        manual_anchor = ui_state.get("manual_scroll_anchor")
         if manual_anchor:
             anchor_pos = tuple(manual_anchor)
             if anchor_pos in self.position_to_line:
                 target_line = self.position_to_line[anchor_pos]
                 self.scroll_offset = float(target_line)
+
+        # Surface non-exact resolutions explicitly.
+        if resolution["status"] == "relocated":
+            self.console.print(
+                f"[yellow]Re-located reading position ({resolution['reason']})[/yellow]"
+            )
+        elif resolution["status"] == "fallback":
+            kept = resolution.get("kept_path") or resolution.get("kept_book_id")
+            self.console.print(
+                "[bold yellow]Could not reliably match the saved position; "
+                f"previous progress was kept for {kept}. Starting from the "
+                "beginning of this file.[/bold yellow]"
+            )
                 
     def _initialize_ui_state(self):
         """Initialize UI and interaction state."""
@@ -839,23 +882,34 @@ class Lue:
     def _save_extended_progress(self, sync_audio_position=False):
         if sync_audio_position:
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        
+
         manual_scroll_anchor = self._get_topmost_visible_sentence()
 
-        progress_manager.save_extended_progress(
-            self.progress_file, 
-            self.chapter_idx, 
-            self.paragraph_idx, 
-            self.sentence_idx, 
-            self.scroll_offset, 
-            not self.is_paused, 
-            self.auto_scroll_enabled,
-            manual_scroll_anchor=manual_scroll_anchor,
-            original_file_path=self.file_path,
-            playback_speed=self.playback_speed,
-            percentage=self._calculate_ui_progress_percentage(),
-            speed_reading_enabled=self.speed_reading_enabled
-        )
+        try:
+            result = self.store.save_reading(
+                identity=self.identity,
+                chapters=self.chapters,
+                c=self.chapter_idx,
+                p=self.paragraph_idx,
+                s=self.sentence_idx,
+                scroll_offset=self.scroll_offset,
+                tts_enabled=not self.is_paused,
+                auto_scroll_enabled=self.auto_scroll_enabled,
+                manual_scroll_anchor=manual_scroll_anchor,
+                playback_speed=self.playback_speed,
+                completion_percentage=self._calculate_ui_progress_percentage(),
+                speed_reading_enabled=self.speed_reading_enabled
+            )
+        except Exception as e:
+            logging.error(f"Failed to save reading state: {e}", exc_info=True)
+            return
+        # A rejected stale save must never overwrite a committed newer state;
+        # adopt the committed view so the next save is based on it.
+        if result.get("status") == "stale_rejected":
+            self.identity = self.store.state["books"].get(
+                self.identity["book_id"],
+                {"identity": self.identity},
+            ).get("identity", self.identity)
 
     def _scroll_to_position_immediate(self, chapter_idx, paragraph_idx, sentence_idx):
         if (chapter_idx, paragraph_idx, sentence_idx) in self.position_to_line:
@@ -870,7 +924,7 @@ class Lue:
         self.scroll_offset = self.target_scroll_offset = max(0, self.scroll_offset - 1)
         if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
         self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+        self._save_extended_progress()
 
     def _handle_scroll_up_smooth(self):
         self.auto_scroll_enabled = False
@@ -881,7 +935,7 @@ class Lue:
             self.scroll_offset = self.target_scroll_offset = target_offset
             if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
         self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+        self._save_extended_progress()
 
     def _handle_scroll_down_immediate(self):
         self.auto_scroll_enabled = False
@@ -889,7 +943,7 @@ class Lue:
         self.scroll_offset = self.target_scroll_offset = min(max_scroll, self.scroll_offset + 1)
         if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
         self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+        self._save_extended_progress()
 
     def _handle_scroll_down_smooth(self):
         self.auto_scroll_enabled = False
@@ -901,7 +955,7 @@ class Lue:
             self.scroll_offset = self.target_scroll_offset = target_offset
             if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
         self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+        self._save_extended_progress()
 
     def _handle_navigation_immediate(self, cmd):
         current_pos = (self.chapter_idx, self.paragraph_idx, self.sentence_idx)
@@ -1307,7 +1361,7 @@ class Lue:
                 self.show_recent_menu = not self.show_recent_menu
                 if self.show_recent_menu:
                     self.show_chapter_index = False
-                    self.recent_books_list = progress_manager.get_recent_books()
+                    self.recent_books_list = self.store.get_recent_books()
                     self.recent_menu_selection_idx = 0
                     # Pause TTS when menu opens
                     if not self.is_paused:
